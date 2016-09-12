@@ -1,5 +1,21 @@
 # coding:utf-8
 
+# TMX library
+# Copyright (c) 2016 wboy <mrtop@126.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 """=========================================
 TMX Map Format (TiledMapEditor 0.17.0)
     http://doc.mapeditor.org/reference/tmx-map-format/#tmx-map-format
@@ -13,17 +29,24 @@ sys.setdefaultencoding('utf-8')
 import logging
 import six
 import os
+import json
+import base64
+import gzip
+import zlib
+import array
 from itertools import chain, product
-from collections import defaultdict, namedtuple
-from xml.etree.ElementTree import *
-from six.moves import zip, map
-from operator import attrgetter
+from collections import defaultdict, namedtuple, OrderedDict
+#from xml.etree.ElementTree import *
+from ElementTree import *
+from six.moves import map
+
 
 logger = logging.getLogger(__name__)
 streamHandler = logging.StreamHandler()
 streamHandler.setLevel(logging.INFO)
 logger.addHandler(streamHandler)
 logger.setLevel(logging.INFO)
+
 
 __all__ = ['TiledObjectType',
            'TiledProperty',
@@ -47,7 +70,6 @@ __all__ = ['TiledObjectType',
            'TiledEllipse',
            'TiledPolygon',
            'TiledPolyline']
-
 
 types = defaultdict(lambda: str)
 types.update({
@@ -97,19 +119,19 @@ types.update({
 
 typesdefaultvalue = defaultdict(lambda: str)
 typesdefaultvalue.update({
-    "version": None,
-    "orientation": None,
-    "renderorder": None,
-    "width": None,
-    "height": None,
-    "tilewidth": None,
-    "tileheight": None,
-    "hexsidelength": None,
-    "staggeraxis": None,
-    "staggerindex": None,
+    "version": "1.0",
+    "orientation": "orthogonal",
+    "renderorder": "right-down",
+    "width": 10,
+    "height": 10,
+    "tilewidth": 32,
+    "tileheight": 32,
+    "hexsidelength": 0,
+    "staggeraxis": "y",
+    "staggerindex": "odd",
     "backgroundcolor": None,
-    "nextobjectid": None,
-    "firstgid": None,
+    "nextobjectid": 0,
+    "firstgid": 1,
     "source": None,
     "name": None,
     "spacing": None,
@@ -134,7 +156,7 @@ typesdefaultvalue.update({
     "compression": None,
     "gid": None,
     "color": None,
-    "draworder": "topdown",
+    "draworder": None,
     "type": None,
     "rotation": None,
     "points": None,
@@ -156,6 +178,7 @@ classtypesnodename.update({
     "TiledFrame"                : "frame",
     "TiledLayer"                : "layer",
     "TiledData"                 : "data",
+    "TiledData_Tile"            : "tile",
     "TiledImagelayer"           : "imagelayer",
     "TiledObjectgroup"          : "objectgroup",
     "TiledObject"               : "object",
@@ -187,7 +210,7 @@ def read_positions(text):
     """parse a text string of float tuples and return [(x,...),...]
     """
     if text is not None:
-        return tuple(tuple(map(float, i.split(','))) for i in text.split())
+        return tuple(tuple(map(format_value, i.split(','))) for i in text.split())
     return None
 
 def write_positions(positions):
@@ -201,11 +224,80 @@ def write_positions(positions):
             result = "%s %s,%s" % (result, x, y)
     return result
 
+def format_value(value, typestr = None):
+    if typestr is not None:
+        if typestr == "bool":
+            if value == str(True).lower(): return True
+            else: return False
+        elif typestr == "float":
+            f = float(value)
+            if f == int(f):
+                return int(f)
+            else:
+                return f
+        elif typestr == "int":
+            return int(value)
+        return value
+    else:
+        if str(value).lower() == str(True).lower(): 
+            return True
+        elif str(value).lower() == str(False).lower():
+            return True
+        else:
+            try:
+                f = float(value)
+                if f == int(f):
+                    return int(f)
+                else:
+                    return f
+            except:
+                return value
+    
+def convert_to_bool(text):
+    """ Convert a few common variations of "true" and "false" to boolean
+
+    :param text: string to test
+    :return: boolean
+    :raises: ValueError
+    """
+    try:
+        return bool(int(text))
+    except:
+        pass
+
+    text = str(text).lower()
+    if text == "true":
+        return True
+    if text == "yes":
+        return True
+    if text == "false":
+        return False
+    if text == "no":
+        return False
+    if text == 0:
+        return False
+    if text == 1:
+        return True
+    
+    raise ValueError
+
+def float_to_int(value):
+    if type(value) is not float:
+        return value
+    else:
+        try:
+            f = float(value)
+            if f == int(f):
+                return int(f)
+            else:
+                return f
+        except:
+            return value
+
 class Enum(set):
     def __getattr__(self, name):
         if name in self:
             return name
-        print name
         raise AttributeError
  
 TiledObjectType = Enum(["NONE", "TILE", "RECTANGLE", "ELLIPSE", "POLYGON", "POLYLINE"])
@@ -226,12 +318,35 @@ class BaseObject(object):
         self._tiledmap = tiledmap
         self._parent = parent
 
-    def read_xml(self, node):
+    def __str__(self):
+        try:
+            return tostring(self.write_xml())
+        except:
+            raise ValueError
+
+    def read_xml(self, node, clearlevel = 1):
         """read the xml attributes to self
 
         :param node: etree element
+        :param clearlevel: clear attribute level
+                           0, Don't Clear
+                           1, Clear public
+                           2, Clear public and protect
+                           3, All Clear (public and protect and private)
         :rtype : BaseObject instance
         """
+        # all attr set None before read xml
+        items = vars(self).items()
+        if items is not None:
+            for key, value in vars(self).items():
+                if clearlevel == 0:
+                    return
+                elif clearlevel == 1:
+                    if key.startswith('_'): continue
+                elif clearlevel == 2:
+                    if key.startswith('__'): continue
+                setattr(self, key, None)
+
         classname = self.__class__.__name__
         classnodename = get_class_node_name(classname)
         if classnodename != node.tag:
@@ -242,21 +357,63 @@ class BaseObject(object):
                 setattr(self, key, casted_value)
         return self
 
-    def write_xml(self):
+    def write_xml(self, outattrorder = None):
         """write the attributes to xml
 
+        :param outattrorder: list()  out attr in order
+                        None(default) is all attr is out
         :rtype : Element instance
         """
         classname = self.__class__.__name__
         element = Element(get_class_node_name(classname))
-        for key, value in vars(self).items():
-           if key.startswith('_'):
-                continue
-           if typesdefaultvalue.has_key(key):
-               if typesdefaultvalue[key] == value:
-                   continue
-           element.set(key, ("%s" % value))
+
+        dictattr = self.__dict__;
+        orderdictattr = OrderedDict()
+        if dictattr:
+            if outattrorder is None or not outattrorder:
+                keys = dictattr.keys()
+            else:
+                keys = outattrorder
+
+            for key in keys:
+                if key.startswith('_') or not dictattr.has_key(key):
+                    continue
+                value = dictattr[key]
+                if value is None : continue
+                if type(value) is list:
+                   element = self._child_list_attr_write_xml(element, value)
+                elif classtypesnodename.has_key(type(value).__name__):
+                    element = self._child_attr_write_xml(element, value)
+                else:
+                    orderdictattr[key] = ("%s" % float_to_int(value))
+        if orderdictattr:
+            element.attrib = orderdictattr
         return element
+
+    def write_json(self):
+        """write the attributes to json
+
+        :rtype : string
+        """
+        dictattr = self.__dict__;
+        if dictattr is None:
+            return None
+
+        dic = {}
+        for key, value in dictattr.items():
+            if key.startswith('_'):
+                continue
+            if value is None : continue
+            if type(value) is list:
+                dic.update(self._child_list_attr_write_json(key, value))
+            elif classtypesnodename.has_key(type(value).__name__):
+                dic = self._child_attr_write_json(dic, value)
+            else:
+                dic[key] = format_value(value)
+        if dic:
+            return dic
+        else:
+            return None
 
     def _child_attr_read_xml(self, parentelement, type, parent):
         childattrelement = parentelement.find(get_class_node_name(type.__name__))
@@ -289,6 +446,22 @@ class BaseObject(object):
                 parentelement = self._child_attr_write_xml(parentelement, attr)
         return parentelement
 
+    def _child_attr_write_json(self, parentdict, childattr):
+        if childattr:
+            childattrdict = childattr.write_json()
+            if childattrdict is not None:
+                parentdict.update(childattrdict)
+        return parentdict
+
+    def _child_list_attr_write_json(self, parentname, childattr):
+        ls = list()
+        if childattr:
+            for attr in childattr:
+                ls.append(attr.write_json())
+        return {parentname : ls}
+            
+            
+
 class TiledMap(BaseObject):
     """TileMap Data. Contains the layers, objects, images, and others
     <map>
@@ -296,109 +469,122 @@ class TiledMap(BaseObject):
 
     Can contain: properties, tileset, layer, objectgroup, imagelayer
     """
-
-    def __init__(self, filepath):
+    def __init__(self, filepath = None):
         self.version = "1.0"
         self.orientation= "orthogonal"
-        self.renderorder = ""
-        self.width = 0
-        self.height = 0
-        self.tilewidth = 0
-        self.tileheight = 0
+        self.renderorder = "right-down"
+        self.width = 10
+        self.height = 10
+        self.tilewidth = 32
+        self.tileheight = 32
         self.hexsidelength = 0
-        self.staggeraxis = ""
-        self.staggerindex = ""
-        self.backgroundcolor = ""
+        self.staggeraxis = "y"
+        self.staggerindex = "odd"
+        self.backgroundcolor = None
         self.nextobjectid = 0
+        self.properties = None
+        self.tilesets = None
+        self.layers = None
         super(TiledMap, self).__init__(self, None)
 
-        self.__filepath = filepath
-        self.__properties = None
-        self.__tilesets = None
-        self.__layers = list()
+        self.__encoding = None
+        self.__compression = None
+        self.__unfoldtsx = False
 
+        self.__filepath = filepath
         if filepath:
             elementTree = parse(filepath).getroot()
             self.read_xml(elementTree)
 
+
     def read_xml(self, node):
         super(TiledMap, self).read_xml(node)
         
-        self.__properties = self._child_attr_read_xml(node, TiledProperties, self)
-        self.__tilesets = self._child_list_attr_read_xml(node, TiledTileset, self)
-        
+        self.properties = self._child_attr_read_xml(node, TiledProperties, self)
+        self.tilesets = self._child_list_attr_read_xml(node, TiledTileset, self)
+        ls = []
         for child in node:
             if child.tag == get_class_node_name(TiledLayer.__name__):
                 tiledlayer = TiledLayer(self, self).read_xml(child)
                 if tiledlayer is not None:
-                   self.__layers.append(tiledlayer)
+                   ls.append(tiledlayer)
             if child.tag == get_class_node_name(TiledImagelayer.__name__):
                 tiledImagelayer = TiledImagelayer(self, self).read_xml(child)
                 if tiledImagelayer is not None:
-                    self.__layers.append(tiledImagelayer)
+                    ls.append(tiledImagelayer)
             if child.tag == get_class_node_name(TiledObjectgroup.__name__):
                 tiledObjectgroup = TiledObjectgroup(self, self).read_xml(child)
                 if tiledObjectgroup is not None:
-                    self.__layers.append(tiledObjectgroup)
-
+                    ls.append(tiledObjectgroup)
+        if ls: self.layers = ls
         return self
 
-    def write_xml(self):
-        element = super(TiledMap, self).write_xml()
-
-        element = self._child_attr_write_xml(element, self.__properties)
-        element = self._child_list_attr_write_xml(element, self.__tilesets)
-        if self.__layers and len(self.__layers):
-            for child in self.__layers:
-                element = self._child_attr_write_xml(element, child)
-        indent(element)
-        return element
-
-    def filepath(self):
-        """ TileMap file path
-        """
-        return self.__filepath
-
-    def properties(self):
-        """ properties info
-        <properties>
-        rtype : TiledProperties instance
-        """
-        return self.__properties
-
-    def tilesets(self):
-        """ all tileset info
-        <tileset>
-        rtype : list  child is TiledTiledet instance
-        """
-        return self.__tilesets
-
-    def layers(self):
-        """ layers info
-        <properties>
-        rtype : list  child is 
-                            TiledLayer instance
-                            or TiledImageLayer
-                            or TiledObjectgroup
-        """
-        return self.__layers
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            outattrorder = ["version", "orientation", "renderorder", "width",
+                            "height", "tilewidth", "tileheight", "hexsidelength",
+                            "staggeraxis", "staggerindex", "backgroundcolor",
+                            "nextobjectid", "properties", "tilesets", "layers"]
+        return super(TiledMap, self).write_xml(outattrorder)
 
     def get_tiledtile_by_gid(self, gid):
         """ get TiledTile by gid
         rtype : TiledTile instance
         """
         firstgid = endgid = 0
-        length = len(self.__tilesets)
+        length = len(self.tilesets)
         for i in range(length):
-            tileset = self.__tilesets[i]
+            tileset = self.tilesets[i]
             firstgid = tileset.firstgid
             if i >= length - 1 :
                 return tileset.get_tiledtile_by_id(gid - firstgid)
             else:
-                endgid = self.__tilesets[i + 1].firstgid
+                endgid = self.tilesets[i + 1].firstgid
                 if firstgid <= gid and endgid > gid:
                     return tileset.get_tiledtile_by_id(gid - firstgid)
         return None
+
+    @property
+    def filepath(self):
+        """ TileMap file path
+        """
+        return self.__filepath
+
+    @property
+    def encoding(self):
+        """encoding: 
+        The encoding used to encode the tile layer data.
+        When used, it can be "base64" and "csv" at the moment.
+        """
+        return self.__encoding
+
+    @encoding.setter
+    def encoding(self, value):
+        self.__encoding = value
+
+    @property
+    def compression(self):
+        """compression: 
+        The compression used to compress the tile layer data. 
+        Tiled Qt supports "gzip" and "zlib".
+        None : Keep the initial state
+        """
+        return self.__compression
+
+    @compression.setter
+    def compression(self, value):
+        self.__compression = value
+
+    @property
+    def unfoldtsx(self):
+        """The unfoldtsx used to read .tsx file data.
+        """
+        return self.__unfoldtsx
+
+    @unfoldtsx.setter
+    def unfoldtsx(self, value):
+        self.__unfoldtsx = value
+
 
     @staticmethod
     def read_tmx_xml(filepath):
@@ -420,13 +606,73 @@ class TiledMap(BaseObject):
         return TiledMap(filepath)
 
     @staticmethod
-    def write_tmx_xml(tiledmap, filepath):
+    def write_tmx_xml(tiledmap, filepath, 
+                      encoding = None, compression = None,
+                      unfoldtsx = True):
         """Read .tmx file
 
         :param filepath: string file's path
-        :rtype TiledMap instance
+        :param encoding: 
+                        The encoding used to encode the tile layer data.
+                        When used, it can be "xml" and "base64" and "csv" at the moment.
+                        None : Keep the initial state
+        :param compression: 
+                        The compression used to compress the tile layer data. 
+                        Tiled Qt supports "gzip" and "zlib".
+                        None : Keep the initial state
+        :param unfoldtsx:
+                        The unfoldtsx used to read .tsx file data.
+                        True : When tileset source is .tsx file. read .tsx file data,
+                               and combine to out data
+                        False : Keep the initial state
+        :rtype True or False
         """
-        ElementTree(tiledmap.write_xml()).write(filepath, encoding="utf-8", xml_declaration="utf-8", method="xml")
+        try:
+            tiledmap.encoding = encoding
+            tiledmap.compression = compression
+            tiledmap.unfoldtsx = unfoldtsx
+            element = tiledmap.write_xml()
+            indent(element)
+            ElementTree(element).write(filepath, encoding="utf-8", xml_declaration="utf-8", method="xml")
+        except Exception,e:
+            logger.exception(e) 
+            return False
+        return True
+
+    @staticmethod
+    def write_tmx_json(tiledmap, filepath, 
+                       encoding = None, compression = None,
+                       unfoldtsx = True):
+        """Read .tmx file
+
+        :param filepath: string file's path
+        :param encoding: 
+                        The encoding used to encode the tile layer data.
+                        When used, it can be "base64" and "csv" at the moment.
+                        None : Keep the initial state
+        :param compression: 
+                        The compression used to compress the tile layer data. 
+                        Tiled Qt supports "gzip" and "zlib".
+                        None : Keep the initial state
+        :param unfoldtsx:
+                        The unfoldtsx used to read .tsx file data.
+                        True : When tileset source is .tsx file. read .tsx file data,
+                               and combine to out data
+                        False : Keep the initial state
+        :rtype True or False
+        """
+        try:
+            tiledmap.encoding = encoding
+            tiledmap.compression = compression
+            tiledmap.unfoldtsx = unfoldtsx
+            dic = tiledmap.write_json()
+            file = open(filepath, "wb")
+            file.write(json.dumps(dic, indent = 4, sort_keys = True))
+            file.flush()
+            file.close()
+        except Exception,e:
+            logger.exception(e) 
+            return False
         return True
 
 
@@ -438,96 +684,95 @@ class TiledTileset(BaseObject):
 
     Can contain: tileoffset (since 0.8), 
                  properties (since 0.8), 
+                 image, 
                  terraintypes (since 0.9),
                  tile
-                 (Notice: 
-                    image is in tile, not appear In other places.
-                    so only this kind of situation.)
-                 image, 
     """
     def __init__(self, tiledmap, parent):
-        self.firstgid = None
+        self.firstgid = 1
         self.source = None
         self.name = None
         self.tilewidth = None
         self.tileheight = None
-        self.spacing = None
-        self.margin = None
+        self.spacing = 0
+        self.margin = 0
         self.tilecount = None
         self.columns = None
         super(TiledTileset, self).__init__(tiledmap, parent)
 
-        self.__tileoffset = None
-        self.__properties = None
-        self.__terraintypes = None
-        self.__tiles = None
+        self.tileoffset = None
+        self.properties = None
+        self.terraintypes = None
+        self.tiles = None
+        self.image = None
 
     def read_xml(self, node):
         super(TiledTileset, self).read_xml(node)
         if self.source is not None and self.source[-4:].lower() == ".tsx":
-            dirname = os.path.dirname(self._tiledmap.filepath())
+            dirname = os.path.dirname(self._tiledmap.filepath)
             path = os.path.abspath(os.path.join(dirname, self.source))
             path = unicode(path, 'utf-8')
             node = parse(path).getroot()
-            super(TiledTileset, self).read_xml(node)
-
-        self.__tileoffset = self._child_attr_read_xml(node, TiledTileoffset, self)
-        self.__properties = self._child_attr_read_xml(node, TiledProperties, self)
-        self.__terraintypes = self._child_attr_read_xml(node, TiledTerraintypes, self)
-        self.__tiles = self._child_list_attr_read_xml(node, TiledTile, self)
+            super(TiledTileset, self).read_xml(node, False)
+        self.tileoffset = self._child_attr_read_xml(node, TiledTileoffset, self)
+        self.properties = self._child_attr_read_xml(node, TiledProperties, self)
+        self.terraintypes = self._child_attr_read_xml(node, TiledTerraintypes, self)
+        self.tiles = self._child_list_attr_read_xml(node, TiledTile, self)
+        self.image = self._child_attr_read_xml(node, TiledImage, self)
         return self
 
-    def write_xml(self):
-        element = super(TiledTileset, self).write_xml()
-        if self.source is not None and self.source[-4:].lower() == ".tsx":
-            element.attrib.clear()
-            element.set('firstgid', ("%s" % self.firstgid))
-            element.set('source', ("%s" % self.source))
-        else:
-            element = self._child_attr_write_xml(element, self.__tileoffset)
-            element = self._child_attr_write_xml(element, self.__properties)
-            element = self._child_attr_write_xml(element, self.__terraintypes)
-            element = self._child_list_attr_write_xml(element, self.__tiles)
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            if self.source is not None and self.source[-4:].lower() == ".tsx":
+                outattrorder = ["firstgid", "source"]
+            else:
+                outattrorder = ["firstgid", "source", "name", "tilewidth",
+                                "tileheight", "spacing", "margin", "tilecount",
+                                "columns", "tileoffset", "properties", "image",
+                                "terraintypes", "tiles"]
+        element = super(TiledTileset, self).write_xml(outattrorder)
         return element
 
-    def tileoffset(self):
-        """ all Property info
-        <tileoffset>
-        rtype : list   child is TiledTileoffset instance
-        """
-        return self.__tileoffset
+    def write_json(self):
+        if self.source is not None:
+            return {"firstgid" : self.firstgid, "source" : self.source}
+        dic = super(TiledTileset, self).write_json()
+        if not dic.has_key("margin"): dic["margin"] = 0
+        if not dic.has_key("spacing"): dic["spacing"] = 0
+        del dic["tiles"]
+        if self.tiles is not None:
+            tilepropvalue = {}
+            tileproptype = {}
+            tilemap = {}
+            for tile in self.tiles:
+                tilemap.update(tile.write_json())
+                if tile.properties is not None:
+                   tempmap = tile.properties.write_json()
+                   tilepropvalue.update({("%s" % tile.id) : tempmap["properties"]})
+                   tileproptype.update({("%s" % tile.id) : tempmap["propertytypes"]})
+            if tilemap:
+                dic.update({"tiles" : tilemap})
+            if tilepropvalue:
+                dic.update({"tileproperties" : tilepropvalue})
+            if tileproptype:
+                dic.update({"tilepropertytypes" : tileproptype})
+        if self.image is not None:
+            dic["imageheight"] = self.image.height
+            dic["imagewidth"] = self.image.width
 
-    def properties(self):
-        """ properties info
-        <properties>
-        rtype : TiledProperties instance
-        """
-        return self.__properties
-
-    def terraintypes(self):
-        """ terraintypes info
-        <terraintypes>
-        rtype : TiledTerraintypes instance
-        """
-        return self.__terraintypes
-
-    def tiles(self):
-        """ list tile info
-        <tile>
-        rtype : list  child is TiledTerraintypes instance
-        """
-        return self.__tiles
+        return dic
 
     def get_tiledtile_by_id(self, id):
         """ get tiledtile by id
 
         rtype : TiledTile instance
         """
-        if self.__tiles is not None:
-            for tile in self.__tiles:
+        if self.tiles is not None:
+            for tile in self.tiles:
                 if tile.id == id:
                     return tile
         return None
+
 
 class TiledTileoffset(BaseObject):
     """ Represents a Tileoffset 
@@ -537,9 +782,17 @@ class TiledTileoffset(BaseObject):
     When not present, no offset is applied.
     """
     def __init__(self, tiledmap, parent):
-        self.x = 0.0
-        self.y = 0.0
+        self.x = None
+        self.y = None
         super(TiledTileoffset, self).__init__(tiledmap, parent)
+
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            outattrorder = ["x", "y"]
+        return super(TiledTileoffset, self).write_xml(outattrorder)
+
+    def write_json(self):
+        return {"tileoffset" : super(TiledTileoffset, self).write_json()}
 
 class TiledProperties(BaseObject):
     """ Properties
@@ -550,24 +803,27 @@ class TiledProperties(BaseObject):
     
     def __init__(self, tiledmap, parent):
         super(TiledProperties, self).__init__(tiledmap, parent)
-        self.__properties = None
+        self.properties = None
 
     def read_xml(self, node):
         super(TiledProperties, self).read_xml(node)
-        self.__properties = self._child_list_attr_read_xml(node, TiledProperty, self)
+        self.properties = self._child_list_attr_read_xml(node, TiledProperty, self)
         return self
 
-    def write_xml(self):
-        element = super(TiledProperties, self).write_xml()
-        element = self._child_list_attr_write_xml(element, self.__properties)
-        return element
-
-    def properties(self):
-        """ all Property info
-        <property>
-        rtype : list   child is TiledProperty instance
-        """
-        return self.__properties
+    def write_json(self):
+        result = None
+        propertiesjson = {}
+        propertytypesjson = {}
+        if self.properties is not None:
+            for item in self.properties:
+                propertiesjson[item.name] = format_value(item.value, item.type)
+                if item.type is None:
+                    propertytypesjson[item.name] = "string"
+                else:
+                    propertytypesjson[item.name] = item.type
+        if propertiesjson and propertytypesjson:
+            return {"properties":propertiesjson, "propertytypes" : propertytypesjson,}
+        return None
 
 class TiledProperty(BaseObject):
     """ Property
@@ -575,10 +831,14 @@ class TiledProperty(BaseObject):
     """
     
     def __init__(self, tiledmap, parent):
-        self.name = ""
-        self.type = ""
-        self.value = ""
+        self.name = None
+        self.type = None
+        self.value = None
         super(TiledProperty, self).__init__(tiledmap, parent)
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            outattrorder = ["name", "type", "value"]
+        return super(TiledProperty, self).write_xml(outattrorder)
 
 class TiledTerraintypes(BaseObject):
     """ Represents a Terraintypes
@@ -588,17 +848,12 @@ class TiledTerraintypes(BaseObject):
     """
     def __init__(self, tiledmap, parent):
         super(TiledTerraintypes, self).__init__(tiledmap, parent)
-        self.__terraintypes = None
+        self.terrains = None
 
     def read_xml(self, node):
         super(TiledTerraintypes, self).read_xml(node)
-        self.__terraintypes = self._child_list_attr_read_xml(node, TiledTerrain, self)
+        self.terrains = self._child_list_attr_read_xml(node, TiledTerrain, self)
         return self
-
-    def write_xml(self):
-        element = super(TiledTerraintypes, self).write_xml()
-        element = self._child_list_attr_write_xml(element, self.__terraintypes)
-        return element
 
 class TiledTerrain(BaseObject):
     """ Represents a Terrain
@@ -610,24 +865,17 @@ class TiledTerrain(BaseObject):
         self.name = None
         self.tile = 0
         super(TiledTerrain, self).__init__(tiledmap, parent)
-        self.__properties = None
+        self.properties = None
 
     def read_xml(self, node):
         super(TiledTerrain, self).read_xml(node)
-        self.__properties = self._child_attr_read_xml(node, TiledProperties, self)
+        self.properties = self._child_attr_read_xml(node, TiledProperties, self)
         return self
-
-    def write_xml(self):
-        element = super(TiledTerrain, self).write_xml()
-        element = self._child_attr_write_xml(element, self.__properties)
-        return element
-
-    def properties(self):
-        """ properties info
-        <properties>
-        rtype : TiledProperties instance
-        """
-        return self.__properties
+    
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            outattrorder = ["name", "tile", "properties"]
+        return super(TiledTerrain, self).write_xml(outattrorder)
 
 class TiledTile(BaseObject):
     """ Represents a Tile
@@ -646,44 +894,43 @@ class TiledTile(BaseObject):
         self.terrain = None
         self.probability = None
         super(TiledTile, self).__init__(tiledmap, parent)
-        self.__properties = None
-        self.__image = None
-        self.__animation = None
+        self.properties = None
+        self.image = None
+        self.animation = None
 
     def read_xml(self, node):
         super(TiledTile, self).read_xml(node)
-        self.__properties = self._child_attr_read_xml(node, TiledProperties, self)
-        self.__image = self._child_attr_read_xml(node, TiledImage, self)
-        self.__animation = self._child_attr_read_xml(node, TiledAnimation, self)
+        self.properties = self._child_attr_read_xml(node, TiledProperties, self)
+        self.image = self._child_attr_read_xml(node, TiledImage, self)
+        self.animation = self._child_attr_read_xml(node, TiledAnimation, self)
         return self
 
-    def write_xml(self):
-        element = super(TiledTile, self).write_xml()
-        element = self._child_attr_write_xml(element, self.__properties)
-        element = self._child_attr_write_xml(element, self.__image)
-        element = self._child_attr_write_xml(element, self.__animation)
-        return element
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            outattrorder = ["id", "terrain", "probability", "properties",
+                                "image", "animation"]
+        return super(TiledTile, self).write_xml(outattrorder)
 
-    def properties(self):
-        """ properties info
-        <properties>
-        rtype : TiledProperties instance
-        """
-        return self.__properties
-
-    def image(self):
-        """ image info
-        <image>
-        rtype : TiledImage instance
-        """
-        return self.__image
-
-    def animation(self):
-        """ animation info
-        <animation>
-        rtype : TiledAnimation instance
-        """
-        return self.__animation
+    def write_json(self):
+        dic = {}
+        if self.probability is not None:
+            dic.update({"probability" : self.probability})
+        if self.terrain is not None:
+            ls = self.terrain.split(',')
+            for i in range(len(ls)):
+                if ls[i]:
+                    ls[i] = format_value(ls[i])
+                else:
+                    ls[i] = -1
+            dic.update({"terrain" : ls})
+        #json 中提取属性 在父级实现统计然后json化
+        #if self.__properties is not None:
+        #    dic.update(self.__properties.write_json())
+        if self.image is not None:
+            dic.update(self.image.write_json())
+        if self.animation is not None:
+            dic.update(self.animation.write_json())
+        return {("%s" % self.id) : dic}
 
 
 class TiledImage(BaseObject):
@@ -701,6 +948,18 @@ class TiledImage(BaseObject):
         self.height = None
         super(TiledImage, self).__init__(tiledmap, parent)
 
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            outattrorder = ["format", "trans", "width", "height",
+                            "source"]
+        return super(TiledImage, self).write_xml(outattrorder)
+
+    def write_json(self):
+        dic = { "image" : self.source }
+        if self.trans is not None:
+            dic["transparentcolor"] = self.trans
+        return dic
+
 class TiledAnimation(BaseObject):
     """ Represents a Animation 
     <animation>
@@ -711,24 +970,18 @@ class TiledAnimation(BaseObject):
     """
     def __init__(self, tiledmap, parent):
         super(TiledAnimation, self).__init__(tiledmap, parent)
-        self.__frames = None
+        self.frames = None
 
     def read_xml(self, node):
         super(TiledAnimation, self).read_xml(node)
-        self.__frames = self._child_list_attr_read_xml(node, TiledFrame, self)
+        self.frames = self._child_list_attr_read_xml(node, TiledFrame, self)
         return self
 
-    def write_xml(self):
-        element = super(TiledAnimation, self).write_xml()
-        element = self._child_list_attr_write_xml(element, self.__frames)
-        return element
-
-    def frames(self):
-        """ all frame info
-        <frame>
-        rtype : list   child is TiledFrame instance
-        """
-        return self.__frames
+    def write_json(self):
+        dic = {}
+        if self.frames is not None:
+            dic.update(self._child_list_attr_write_json("animation", self.frames))
+        return dic
 
 class TiledFrame(BaseObject):
     """ Represents a Frame 
@@ -739,7 +992,10 @@ class TiledFrame(BaseObject):
         duration = None
         super(TiledFrame, self).__init__(tiledmap, parent)
 
-
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            outattrorder = ["tileid", "duration"]
+        return super(TiledFrame, self).write_xml(outattrorder)
 
 
 class TiledLayer(BaseObject):
@@ -763,34 +1019,36 @@ class TiledLayer(BaseObject):
         self.offsetx = None
         self.offsety = None
         super(TiledLayer, self).__init__(tiledmap, parent)
-        self.__properties = None
-        self.__data = None
+        self.properties = None
+        self.data = None
 
     def read_xml(self, node):
         super(TiledLayer, self).read_xml(node)
-        self.__properties = self._child_attr_read_xml(node, TiledProperties, self)
-        self.__data = self._child_attr_read_xml(node, TiledData, self)
+        self.properties = self._child_attr_read_xml(node, TiledProperties, self)
+        self.data = self._child_attr_read_xml(node, TiledData, self)
         return self
 
-    def write_xml(self):
-        element = super(TiledLayer, self).write_xml()
-        element = self._child_attr_write_xml(element, self.__properties)
-        element = self._child_attr_write_xml(element, self.__data)
-        return element
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            outattrorder = ["name", "x", "y", "width",
+                            "height", "opacity", "visible", "offsetx",
+                            "offsety", "properties", "data"]
+        return super(TiledLayer, self).write_xml(outattrorder)
 
-    def properties(self):
-        """ properties info
-        <properties>
-        rtype : TiledProperties instance
-        """
-        return self.__properties
-
-    def data(self):
-        """ data info
-        <data>
-        rtype : TiledData instance
-        """
-        return self.__data
+    def write_json(self):
+        dic = super(TiledLayer, self).write_json()
+        dic["type"] = "tilelayer"
+        if self.visible is None:
+            dic["visible"] = True
+        else:
+            dic["visible"] = convert_to_bool(self.visible)
+        if self.name is None: dic["name"] = ""
+        if self.x is None: dic["x"] = 0
+        if self.y is None: dic["y"] = 0
+        if self.width is None: dic["width"] = 0
+        if self.height is None: dic["height"] = 0
+        if self.opacity is None: dic["opacity"] = 1
+        return dic
 
 class TiledData(BaseObject):
     """ Represents a data 
@@ -810,79 +1068,69 @@ class TiledData(BaseObject):
         self.compression = None
         super(TiledData, self).__init__(tiledmap, parent)
         self.__datasrc = None
-        self.__data = None
+        self.__one_d_data = None
+        self.__two_d_data = None
+        self.__tiles = None
 
     def read_xml(self, node):
         super(TiledData, self).read_xml(node)
-
         self.__datasrc = node.text
-        self.__data = None
-        tempdata = None
-        next_gid = None
-        
-        if self.encoding == 'base64':
-            from base64 import b64decode
-            tempdata = b64decode(self.__datasrc.strip())
-        elif self.encoding == 'csv':
-            next_gid = map(int, "".join(
-                line.strip() for line in self.__datasrc.strip()
-            ).split(","))
-        elif encodeing:
-            msg = 'TMX encoding type: {0} is not supported.'
-            logger.error(msg.format(encoding))
-            raise Exception
-
-        if self.compression == 'gzip':
-            import gzip
-
-            with gzip.GzipFile(fileobj=six.BytesIO(tempdata)) as fh:
-                tempdata = fh.read()
-        elif self.compression == 'zlib':
-            import zlib
-
-            tempdata = zlib.decompress(tempdata)
-        elif self.compression:
-            msg = 'TMX compression type: {0} is not supported.'
-            logger.error(msg.format(compression))
-            raise Exception
-        
-        import struct
-        import array
-
-        # if data is None, then it was not decoded or decompressed, so
-        # we assume here that it is going to be a bunch of tile elements
-        # TODO: this will/should raise an exception if there are no tiles
-        if self.encoding == next_gid is None:
-            def get_children(parent):
-                for child in parent.findall('tile'):
-                    yield int(child.get('gid'))
-
-            next_gid = get_children(node)
-
-        elif tempdata:
-            if type(tempdata) == bytes:
-                fmt = struct.Struct('<L')
-                iterator = (tempdata[i:i + 4] for i in range(0, len(tempdata), 4))
-                next_gid = (fmt.unpack(i)[0] for i in iterator)
-            else:
-                msg = 'layer data not in expected format ({})'
-                logger.error(msg.format(type(tempdata)))
-                raise Exception
-
-        init = lambda: [0] * self._parent.width
-        reg = self._tiledmap.get_tiledtile_by_gid
-        
-        # H (16-bit) may be a limitation for very detailed maps
-        self.__data = tuple(array.array('H', init()) for i in range(self._parent.height))
-        for (y, x) in product(range(self._parent.height), range(self._parent.width)):
-            gid = int("%s" % next(next_gid))
-            self.__data[y][x] = gid
+        if self.__datasrc is not None and self.__datasrc.strip():
+            self.__one_d_data = self.__data_decode(self.__datasrc, self.encoding, self.compression)
+        self.__tiles = self._child_list_attr_read_xml(node, TiledData_Tile, self) 
+        if self.__tiles is not None:
+            self.__one_d_data = self.__data_decode(self.__tiles, "xml", self.compression)
+        self.__two_d_data = self.__one_d_change_two_d(self.__one_d_data)
         return self
 
-    def write_xml(self):
-        element = super(TiledData, self).write_xml()
-        element.text = self.__datasrc
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            outattrorder = ["encoding", "compression"]
+        element = super(TiledData, self).write_xml(outattrorder)
+
+        if (self._tiledmap.encoding is None and self._tiledmap.compression is None):
+            element.text = self.__datasrc
+            element = self._child_list_attr_write_xml(element, self.__tiles)
+        elif (self._tiledmap.encoding == self.encoding and self._tiledmap.compression == self.compression):
+            element.text = self.__datasrc
+            element = self._child_list_attr_write_xml(element, self.__tiles)
+        else:
+            encoding = self._tiledmap.encoding
+            if encoding is None:
+                encoding = self.encoding
+            else:
+                element.set("encoding", encoding)
+            compression = self._tiledmap.compression
+            if compression is None:
+                compression = self.compression
+            else:
+                element.set("compression", compression)
+            element = self.__data_encode_xml(self.__one_d_data, element, encoding, compression)
         return element
+
+    def write_json(self):
+        if (self._tiledmap.encoding is None and self._tiledmap.compression is None) or (self._tiledmap.encoding == self.encoding and self._tiledmap.compression == self.compression):
+            dic = {}
+            if self.__datasrc is not None and self.__datasrc.strip():
+                if self.encoding is None:
+                    dic["data"] = self.__one_d_data
+                elif self.encoding == "csv":
+                    del dic["encoding"]
+                    dic["data"] = self.__one_d_data
+                else:
+                    dic = super(TiledData, self).write_json();
+                    dic["data"] = self.__datasrc.strip()
+            if self.__tiles is not None:
+                dic["data"] = self.__one_d_data
+            return dic
+        else:
+            encoding = self._tiledmap.encoding
+            if encoding is None:
+                encoding = self.encoding
+            compression = self._tiledmap.compression
+            if compression is None:
+                compression = self.compression
+            return self.__data_encode_json(self.__one_d_data, encoding, compression)
 
     def datasrc(self):
         """ The original data
@@ -892,21 +1140,178 @@ class TiledData(BaseObject):
         """
         return self.__datasrc
 
-    def data(self):
+    def one_d_data(self):
         """ data
 
-        format datasrc to data
-        May be datasrc = data; or encrypted datasrc to data
+        format datasrc to one d data
+        May be datasrc = data; or encrypted datasrc to one d data
         """
-        return self.__data
+        return self.__one_d_data
+
+    def two_d_data(self):
+        """ data
+
+        format datasrc to two d data
+        May be datasrc = data; or encrypted datasrc to two d data
+        """
+        return self.__two_d_data
 
     def get_tiledtile_position(self, x, y):
         """ get tiledtile position
         rtype : TiledTile instance
         """
-        gid = self.__data[y, x]
+        gid = self.__two_d_data[y, x]
         return self._tiledmap.get_tiledtile_by_gid(gid)
 
+    def __one_d_change_two_d(self, data):
+        init = lambda: [0] * self._parent.width
+        result = tuple(array.array('H', init()) for i in range(self._parent.height))
+        for (y, x) in product(range(self._parent.height), range(self._parent.width)):
+            result[y][x] = data[y * self._parent.width + x]
+        return result
+
+    def __data_decode(self, data, encoding = None, compression = None):
+        """ data decode
+
+        param data : Tile instance list or string
+        param encoding : None or "xml" or "csv" or "base64"
+        param compression : None or "gzip" or "zlib"
+
+        rtype : one_d list
+        """
+        if encoding is None or encoding == "xml":
+            data = [int(i.gid) for i in data]
+        elif encoding == "csv":
+            data = [int(i) for i in self.__datasrc.strip().split(",")]
+        elif encoding == "base64":
+            data = base64.b64decode(data.strip().encode("latin1"))
+            if compression == "gzip":
+                # data = gzip.decompress(data)
+                with gzip.GzipFile(fileobj=six.BytesIO(data)) as f:
+                    data = f.read()
+            elif compression == "zlib":
+                data = zlib.decompress(data)
+            elif compression:
+                e = 'Compression type "{}" not supported.'.format(compression)
+                raise ValueError(e)
+
+            if six.PY2:
+                ndata = [ord(c) for c in data]
+            else:
+                ndata = [i for i in data]
+
+            data = []
+            for i in six.moves.range(0, len(ndata), 4):
+                n = (ndata[i]  + ndata[i + 1] * (2 ** 8) +
+                 ndata[i + 2] * (2 ** 16) + ndata[i + 3] * (2 ** 24))
+                data.append(n)
+        else:
+            e = 'Encoding type "{}" not supported.'.format(encoding)
+            raise ValueError(e)
+        return data
+
+    def __data_encode_xml(self, data, element, encoding = None, compression = None):
+        """ data encode
+
+        param data : 1d_data
+        param encoding : "xml" or "csv" or "base64"
+        param compression : None or "gzip" or "zlib"
+        rtype: Element instance
+        """
+        if encoding is None or encoding == "xml":
+            element.attrib.clear()
+            for item in data:
+                childelement = Element("tile")
+                childelement.set("gid", ("%s" % item))
+                element.append(childelement)
+        elif encoding == "csv":
+            element.attrib.clear()
+            element.set("encoding", encoding)
+            context = "\n".join([",".join([
+                                            str(data[y * self._parent.width + x]) for x in range(self._parent.width)
+                                          ])
+                                 for y in range(self._parent.height)
+                               ])
+            element.text = "\n" + context + "\n"
+        elif encoding == "base64":
+            ndata = []
+            for i in data:
+                n = [i % (2 ** 8), i // (2 ** 8), i // (2 ** 16), i // ( 2 ** 24)]
+                ndata.extend(n)
+
+            if six.PY2:
+                data = b''.join([chr(i) for i in ndata])
+            else:
+                data = b''.join([bytes((i,)) for i in ndata])
+
+            if compression == "gzip":
+                bytes_io = six.BytesIO()
+                with gzip.GzipFile(fileobj=bytes_io, mode = 'wb') as f:
+                    f.write(data)
+                    f.close()
+                data = bytes_io.getvalue()
+            elif compression == "zlib":
+                data = zlib.compress(data)
+            elif compression:
+                e = 'Compression type "{}" not supported.'.format(compression)
+                raise ValueError(e)
+            element.text = "\n      " + base64.b64encode(data).decode("latin1") + "\n    "
+        else:
+            e = 'Encoding type "{}" not supported.'.format(encoding)
+            raise ValueError(e)
+        return element
+
+    def __data_encode_json(self, data, encoding = None, compression = None):
+        """ data encode
+
+        param data : 1d_data
+        param encoding : "xml" or "csv" or "base64"
+        param compression : None or "gzip" or "zlib"
+        rtype : dict
+        """
+        dict = {}
+        if encoding is None or encoding == "xml":
+            dict["data"] = data
+        elif encoding == "csv":
+            dict["data"] = data
+        elif encoding == "base64":
+            dict["encoding"] = "base64"
+            if compression is not None:
+                dict["compression"] = compression
+            ndata = []
+            for i in data:
+                n = [i % (2 ** 8), i // (2 ** 8), i // (2 ** 16), i // ( 2 ** 24)]
+                ndata.extend(n)
+
+            if six.PY2:
+                data = b''.join([chr(i) for i in ndata])
+            else:
+                data = b''.join([bytes((i,)) for i in ndata])
+
+            if compression == "gzip":
+                bytes_io = six.BytesIO()
+                with gzip.GzipFile(fileobj=bytes_io, mode = 'wb') as f:
+                    f.write(data)
+                    f.close()
+                data = bytes_io.getvalue()
+            elif compression == "zlib":
+                data = zlib.compress(data)
+            elif compression:
+                e = 'Compression type "{}" not supported.'.format(compression)
+                raise ValueError(e)
+            dict["data"] = base64.b64encode(data).decode("latin1")
+        else:
+            e = 'Encoding type "{}" not supported.'.format(encoding)
+            raise ValueError(e)
+        return dict
+
+class TiledData_Tile(BaseObject):
+    """ Represents a Tile 
+    <data><tile gid="0" /> ... </data>
+    """
+    def __init__(self, tiledmap = None, parent = None):
+        self.gid = None
+        super(TiledData_Tile, self).__init__(tiledmap, parent)
 
 class TiledImagelayer(BaseObject):
     """ Represents a Imagelayer 
@@ -929,27 +1334,36 @@ class TiledImagelayer(BaseObject):
         self.visible = None
         super(TiledImagelayer, self).__init__(tiledmap, parent)
 
-        self.__properties = None
-        self.__image = None
+        self.properties = None
+        self.image = None
 
     def read_xml(self, node):
         super(TiledImagelayer, self).read_xml(node)
-        self.__properties = self._child_attr_read_xml(node, TiledProperties, self)
-        self.__image = self._child_attr_read_xml(node, TiledImage, self)
+        self.properties = self._child_attr_read_xml(node, TiledProperties, self)
+        self.image = self._child_attr_read_xml(node, TiledImage, self)
         return self
 
-    def write_xml(self):
-        element = super(TiledImagelayer, self).write_xml()
-        element = self._child_attr_write_xml(element, self.__properties)
-        element = self._child_attr_write_xml(element, self.__image)
-        return element
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            outattrorder = ["name", "visible", "offsetx", "offsety",
+                            "x", "y", "width", "height",
+                            "opacity", "image", "properties"]
+        return super(TiledImagelayer, self).write_xml(outattrorder)
 
-    def properties(self):
-        """ properties info
-        <properties>
-        rtype : TiledProperties instance
-        """
-        return self.__properties
+    def write_json(self):
+        dic = super(TiledImagelayer, self).write_json()
+        dic["type"] = "imagelayer"
+        if self.visible is None:
+            dic["visible"] = True
+        else:
+            dic["visible"] = convert_to_bool(self.visible)
+        if self.name is None: dic["name"] = ""
+        if self.x is None: dic["x"] = 0
+        if self.y is None: dic["y"] = 0
+        if self.width is None: dic["width"] = 0
+        if self.height is None: dic["height"] = 0
+        if self.opacity is None: dic["opacity"] = 1
+        return dic
 
     def image(self):
         """ image info
@@ -981,34 +1395,38 @@ class TiledObjectgroup(BaseObject):
         self.offsety = None
         self.draworder = None
         super(TiledObjectgroup, self).__init__(tiledmap, parent)
-
-        self.__objects = None
+        self.properties = None
+        self.objects = None
 
     def read_xml(self, node):
         super(TiledObjectgroup, self).read_xml(node)
-        self.__properties = self._child_attr_read_xml(node, TiledProperties, self)
-        self.__objects = self._child_list_attr_read_xml(node, TiledObject, self)
+        self.properties = self._child_attr_read_xml(node, TiledProperties, self)
+        self.objects = self._child_list_attr_read_xml(node, TiledObject, self)
         return self
 
-    def write_xml(self):
-        element = super(TiledObjectgroup, self).write_xml()
-        element = self._child_attr_write_xml(element, self.__properties)
-        element = self._child_list_attr_write_xml(element, self.__objects)
-        return element
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            outattrorder = ["name", "color", "x", "y",
+                            "width", "height", "opacity", "visible",
+                            "offsetx", "offsety", "draworder", "properties",
+                            "objects"]
+        return super(TiledObjectgroup, self).write_xml(outattrorder)
 
-    def properties(self):
-        """ properties info
-        <properties>
-        rtype : TiledProperties instance
-        """
-        return self.__properties
-
-    def objects(self):
-        """ objects info
-        <object>
-        rtype : list()  child is TiledObject instance
-        """
-        return self.__objects
+    def write_json(self):
+        dic = super(TiledObjectgroup, self).write_json()
+        dic["type"] = "objectgroup"
+        if self.visible is None:
+            dic["visible"] = True
+        else:
+            dic["visible"] = convert_to_bool(self.visible)
+        if self.name is None: dic["name"] = ""
+        if self.x is None: dic["x"] = 0
+        if self.y is None: dic["y"] = 0
+        if self.width is None: dic["width"] = 0
+        if self.height is None: dic["height"] = 0
+        if self.opacity is None: dic["opacity"] = 1
+        if self.draworder is None: dic["draworder"] = "topdown"
+        return dic
 
 class TiledObject(BaseObject):
     """ Represents a Object
@@ -1042,23 +1460,24 @@ class TiledObject(BaseObject):
         self.visible = None
         super(TiledObject, self).__init__(tiledmap, parent)
         
-        self.__ellipse = None
-        self.__polygon = None
-        self.__polyline = None
+        self.properties = None
+        self.ellipse = None
+        self.polygon = None
+        self.polyline = None
         self.__tile = None
         self.__objecttype = TiledObjectType.NONE
 
     def read_xml(self, node):
         super(TiledObject, self).read_xml(node)
-        self.__properties = self._child_attr_read_xml(node, TiledProperties, self)
-        self.__ellipse = self._child_attr_read_xml(node, TiledEllipse, self)
-        self.__polygon = self._child_attr_read_xml(node, TiledPolygon, self)
-        self.__polyline = self._child_attr_read_xml(node, TiledPolyline, self)
-        if self.__ellipse is not None:
+        self.properties = self._child_attr_read_xml(node, TiledProperties, self)
+        self.ellipse = self._child_attr_read_xml(node, TiledEllipse, self)
+        self.polygon = self._child_attr_read_xml(node, TiledPolygon, self)
+        self.polyline = self._child_attr_read_xml(node, TiledPolyline, self)
+        if self.ellipse is not None:
             self.__objecttype = TiledObjectType.ELLIPSE
-        elif self.__polygon is not None:
+        elif self.polygon is not None:
             self.__objecttype = TiledObjectType.POLYGON
-        elif self.__polyline is not None:
+        elif self.polyline is not None:
             self.__objecttype = TiledObjectType.POLYLINE
         elif self.gid is not None:
             tiledtile = self._tiledmap.get_tiledtile_by_gid(self.gid)
@@ -1069,20 +1488,28 @@ class TiledObject(BaseObject):
             self.__objecttype = TiledObjectType.RECTANGLE
         return self
 
-    def write_xml(self):
-        element = super(TiledObject, self).write_xml()
-        element = self._child_attr_write_xml(element, self.__properties)
-        element = self._child_attr_write_xml(element, self.__ellipse)
-        element = self._child_attr_write_xml(element, self.__polygon)
-        element = self._child_attr_write_xml(element, self.__polyline)
-        return element
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            outattrorder = ["id", "gid", "name", "type",
+                            "x","y", "width", "height",
+                            "rotation", "visible", "properties",
+                            "ellipse", "polygon", "polyline"]
+        return super(TiledObject, self).write_xml(outattrorder)
 
-    def properties(self):
-        """ properties info
-        <properties>
-        rtype : TiledProperties instance
-        """
-        return self.__properties
+    def write_json(self):
+        dic = super(TiledObject, self).write_json()
+        if self.visible is None:
+            dic["visible"] = True
+        else:
+            dic["visible"] = convert_to_bool(self.visible)
+        if self.name is None: dic["name"] = ""
+        if self.type is None: dic["type"] = ""
+        if self.x is None: dic["x"] = 0
+        if self.y is None: dic["y"] = 0
+        if self.width is None: dic["width"] = 0
+        if self.height is None: dic["height"] = 0
+        if self.rotation is None: dic["rotation"] = 0
+        return dic
 
     def objecttype(self):
         """ object type
@@ -1097,27 +1524,6 @@ class TiledObject(BaseObject):
         """
         return self.__tile
 
-    def ellipse(self):
-        """ Ellipse info
-        <ellipse>
-        rtype : None or TiledEllipse instance
-        """
-        return self.__ellipse
-
-    def polygon(self):
-        """ Polygon info
-        <polygon>
-        rtype : None or TiledPolygon instance
-        """
-        return self.__polygon
-
-    def polyline(self):
-        """ Polyline info
-        <polyline>
-        rtype : None or TiledPolyline instance
-        """
-        return self.__polyline
-
 class TiledEllipse(BaseObject):
     """ Represents a Ellipse Object
     <ellipse>
@@ -1126,6 +1532,20 @@ class TiledEllipse(BaseObject):
     The existing x, y, width and height attributes 
     are used to determine the size of the ellipse.
     """
+    def __init__(self, tiledmap = None, parent = None):
+        self.properties = None
+
+    def read_xml(self, node):
+        super(TiledEllipse, self).read_xml(node)
+        self.properties = self._child_attr_read_xml(node, TiledProperties, self)
+        return self
+
+    def write_json(self):
+        dic = {"ellipse" : True}
+        superdic = super(TiledEllipse, self).write_json()
+        if superdic:
+            dic.update(superdic)
+        return dic
 
 class TiledPolygon(BaseObject):
     """ Represents a Polygon Object
@@ -1141,16 +1561,36 @@ class TiledPolygon(BaseObject):
     def __init__(self, tiledmap, parent):
         self.points = None
         super(TiledPolygon, self).__init__(tiledmap, parent)
-        
+        self.properties = None
+
         self.__positions = None
         self.__width = 0.0
         self.__height = 0.0
 
     def read_xml(self, node):
         super(TiledPolygon, self).read_xml(node)
+        self.properties = self._child_attr_read_xml(node, TiledProperties, self)
         self.__positions = read_positions(self.points)
         self.__recalculate()
         return self
+
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            outattrorder = ["properties", "points"]
+        return super(TiledPolygon, self).write_xml(outattrorder)
+
+    def write_json(self):
+        dic = {}
+        ls = []
+        for position in self.__positions:
+            ls.append({"x":position[0], "y":position[1]})
+        if ls:
+            dic["polygon"] = ls
+        superdic = super(TiledPolygon, self).write_json()
+        if superdic:
+            del superdic["points"]
+            dic.update(superdic)
+        return dic
 
     @property
     def positions(self):
@@ -1184,21 +1624,40 @@ class TiledPolyline(BaseObject):
     <polyline>
 
     A polyline follows the same placement
-    definition as a polygon object.
+    definition as a polyline object.
     """
     def __init__(self, tiledmap, parent):
         self.points = None
         super(TiledPolyline, self).__init__(tiledmap, parent)
-        
+        self.properties = None
         self.__positions = None
         self.__width = 0.0
         self.__height = 0.0
 
     def read_xml(self, node):
         super(TiledPolyline, self).read_xml(node)
+        self.properties = self._child_attr_read_xml(node, TiledProperties, self)
         self.__positions = read_positions(self.points)
         self.__recalculate()
         return self
+
+    def write_xml(self, outattrorder = None):
+        if outattrorder is None:
+            outattrorder = ["properties", "points"]
+        return super(TiledPolyline, self).write_xml(outattrorder)
+
+    def write_json(self):
+        dic = {}
+        ls = []
+        for position in self.__positions:
+            ls.append({"x":position[0], "y":position[1]})
+        if ls:
+            dic["polyline"] = ls
+        superdic = super(TiledPolyline, self).write_json()
+        if superdic:
+            del superdic["points"]
+            dic.update(superdic)
+        return dic
 
     @property
     def positions(self):
